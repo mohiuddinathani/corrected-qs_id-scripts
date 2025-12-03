@@ -1,0 +1,214 @@
+# nvd_vendor_fallback.py (Production Version)
+import os
+import json
+import logging
+import psycopg2
+import psycopg2.extras
+from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+from tqdm import tqdm
+import sys
+
+# --- Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("nvd_fallback")
+load_dotenv()
+
+# --- Configuration ---
+# Source: Where we read NVD data from
+SOURCE_DB_CONFIG = {
+    "dbname": os.getenv("SOURCE_DB_NAME") or os.getenv("DB_NAME"), # Fallback to main DB if source not defined
+    "user": os.getenv("SOURCE_DB_USER") or os.getenv("DB_USER"),
+    "password": os.getenv("SOURCE_DB_PASSWORD") or os.getenv("DB_PASS"),
+    "host": os.getenv("SOURCE_DB_HOST") or os.getenv("DB_HOST"),
+    "port": os.getenv("SOURCE_DB_PORT") or os.getenv("DB_PORT")
+}
+
+# Destination: Where we write normalized data to
+DEST_DB_CONFIG = {
+    "dbname": os.getenv("DEST_DB_NAME") or os.getenv("DB_NAME"),
+    "user": os.getenv("DEST_DB_USER") or os.getenv("DB_USER"),
+    "password": os.getenv("DEST_DB_PASSWORD") or os.getenv("DB_PASS"),
+    "host": os.getenv("DEST_DB_HOST") or os.getenv("DB_HOST"),
+    "port": os.getenv("DEST_DB_PORT") or os.getenv("DB_PORT")
+}
+
+KEYWORDS_FILE = 'keywords.json'
+
+# --- Helper Functions ---
+def load_keywords(filepath):
+    try:
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Could not load keywords: {e}")
+        return {}
+
+def get_or_create_vendor(cur, vendor_name):
+    cur.execute("SELECT vendor_id FROM vendors WHERE vendor_name = %s;", (vendor_name,))
+    result = cur.fetchone()
+    if result:
+        return result[0]
+    else:
+        cur.execute("INSERT INTO vendors (vendor_name) VALUES (%s) RETURNING vendor_id;", (vendor_name,))
+        return cur.fetchone()[0]
+
+def fetch_nvd_data(source_conn, keywords):
+    """
+    Searches the NVD table for any CVEs matching the provided keywords.
+    This uses ILIKE on the JSONB column cast to text, which is heavy but necessary here.
+    """
+    results = {}
+    
+    # Deduplicate keywords and prepare query
+    unique_keywords = list(set(keywords))
+    
+    query = """
+        SELECT
+            cve_id,
+            initial_release_date,
+            latest_update_date,
+            description,
+            reference_url,
+            cwe_id,
+            cvss_score,
+            cvss_vector,
+            severity,
+            affected_products_cpe
+        FROM nvd_cves
+        WHERE 
+    """
+    
+    # Dynamically build OR clause for keywords to do one pass per vendor
+    conditions = []
+    params = []
+    for kw in unique_keywords:
+        conditions.append("affected_products_cpe::text ILIKE %s")
+        params.append(f"%{kw}%")
+    
+    if not conditions:
+        return []
+
+    query += " OR ".join(conditions)
+
+    try:
+        with source_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+            return rows
+    except Exception as e:
+        logger.error(f"Error fetching from NVD: {e}")
+        source_conn.rollback()
+        return []
+
+# --- Main Orchestrator ---
+def main():
+    logger.info("🚀 Starting NVD Vendor Fallback Processor...")
+    
+    vendor_map = load_keywords(KEYWORDS_FILE)
+    if not vendor_map:
+        logger.error("No keywords found. Exiting.")
+        return
+
+    try:
+        # Connect to Source (NVD) and Dest (Production)
+        # They might be the same DB, but we treat them as separate connections for safety
+        with psycopg2.connect(**SOURCE_DB_CONFIG) as source_conn, \
+             psycopg2.connect(**DEST_DB_CONFIG) as dest_conn:
+            
+            # Destination Cursor
+            with dest_conn.cursor() as dest_cur:
+                
+                for vendor_name, keywords in tqdm(vendor_map.items(), desc="Processing Vendors"):
+                    
+                    # 1. Fetch Data from NVD
+                    vulns = fetch_nvd_data(source_conn, keywords)
+                    if not vulns:
+                        continue
+                        
+                    # 2. Get Vendor ID (Destination)
+                    vendor_id = get_or_create_vendor(dest_cur, vendor_name)
+                    
+                    cves = []
+                    cve_product_maps = {}
+                    
+                    # 3. Prepare Data Structures
+                    for row in vulns:
+                        cve_id = row['cve_id']
+                        
+                        # Prepare CVE Record
+                        cves.append((
+                            vendor_id, cve_id,
+                            row.get('cwe_id'),
+                            row.get('description'),
+                            row.get('severity'),
+                            row.get('cvss_score'),
+                            row.get('cvss_vector'),
+                            row.get('initial_release_date'),
+                            row.get('latest_update_date'),
+                            row.get('reference_url')
+                        ))
+                        
+                        # Prepare Product Map
+                        # Ensure affected_products_cpe is valid JSON
+                        cpe_data = row.get('affected_products_cpe')
+                        if cpe_data and not isinstance(cpe_data, (dict, list)):
+                            try:
+                                cpe_data = json.loads(cpe_data)
+                            except:
+                                cpe_data = []
+                        
+                        cve_product_maps[(vendor_id, cve_id)] = (
+                            vendor_id, cve_id, 
+                            Json(cpe_data) if cpe_data else None, 
+                            "Derived from NVD Data"
+                        )
+
+                    # 4. Bulk Insert
+                    if cves:
+                        # Insert CVEs
+                        execute_values(dest_cur, """
+                            INSERT INTO cves (
+                                vendor_id, cve_id, cwe_id, description, severity, 
+                                cvss_score, cvss_vector, initial_release_date, 
+                                latest_update_date, reference_url
+                            ) VALUES %s
+                            ON CONFLICT (vendor_id, cve_id) DO UPDATE SET
+                                description = COALESCE(EXCLUDED.description, cves.description),
+                                severity = COALESCE(EXCLUDED.severity, cves.severity),
+                                cvss_score = COALESCE(EXCLUDED.cvss_score, cves.cvss_score),
+                                latest_update_date = EXCLUDED.latest_update_date;
+                        """, cves)
+
+                    if cve_product_maps:
+                        # --- CRITICAL FIX: Sync Sequence ---
+                        dest_cur.execute("""
+                            SELECT setval('qs_id_seq', COALESCE((
+                                SELECT MAX(SUBSTRING(qs_id FROM 4)::INTEGER) 
+                                FROM cve_product_map
+                            ), 0) + 1);
+                        """)
+
+                        # Insert Product Maps
+                        execute_values(dest_cur, """
+                            INSERT INTO cve_product_map (
+                                vendor_id, cve_id, affected_products_cpe, recommendations
+                            ) VALUES %s
+                            ON CONFLICT (vendor_id, cve_id) DO UPDATE SET
+                                affected_products_cpe = EXCLUDED.affected_products_cpe;
+                        """, list(cve_product_maps.values()))
+                    
+                    dest_conn.commit()
+                    logger.info(f"Synced {len(cves)} NVD records for {vendor_name}")
+
+        logger.info("✅ Fallback processing complete.")
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    main()
